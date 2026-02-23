@@ -9,7 +9,8 @@ Evals and other code should use the appropriate interface.
 from dataclasses import dataclass
 from typing import TypeAlias
 
-import tinker
+from ttt_discover.opentinker_backend.data_types import SamplingParams, TokenSequence
+from ttt_discover.opentinker_backend.clients import VLLMSamplingClient
 from ttt_discover.tinker_utils.misc_utils import Tokenizer
 
 # Interfaces
@@ -39,7 +40,7 @@ class TokensWithLogprobs:
 
 class TokenCompleter:
     async def __call__(
-        self, model_input: tinker.ModelInput, stop: StopCondition
+        self, model_input: TokenSequence, stop: StopCondition
     ) -> TokensWithLogprobs:
         raise NotImplementedError
 
@@ -50,7 +51,7 @@ class TwoPhaseTokenCompleter(TokenCompleter):
     Two-phase completer for gpt-oss: if Phase 1 exhausts tokens without stop, Phase 2 forces final answer.
     Uses full context window dynamically.
     """
-    sampling_client: tinker.SamplingClient
+    sampling_client: VLLMSamplingClient
     tokenizer: Tokenizer
     phase1_max_tokens: int  # Phase 1 limit (e.g., 27000)
     temperature: float = 1.0
@@ -87,23 +88,19 @@ class TwoPhaseTokenCompleter(TokenCompleter):
                 return True
         return False
 
-    async def __call__(self, model_input: tinker.ModelInput, stop: StopCondition) -> TokensWithLogprobs:
+    async def __call__(self, model_input: TokenSequence, stop: StopCondition) -> TokensWithLogprobs:
         prompt_length = model_input.length
-        
+
         # phase1_max_tokens is the total context budget for phase 1 (prompt + output)
         # This guarantees (context_window - phase1_max_tokens - buffer) tokens for phase 2
-        # e.g., context_window = 32768, buffer = 50, prompt_length = 2000, phase1_max_tokens = 25000
-        # then, in phase 1, we can generate at most 25000 - 2000 = 23000 tokens
-        # in phase 2, we can generate at most 32768 - 2000 - 23000 - 50 = 7718 tokens
-        # If prompt_length = 8000, then we can generate at most 25000 - 8000 = 17000 thinking tokens
         phase1_max = self.phase1_max_tokens - prompt_length
         if phase1_max <= 0:
             raise ValueError(f"Prompt length {prompt_length} exceeds phase1_max_tokens {self.phase1_max_tokens}.")
-        
+
         phase1_result = await self.sampling_client.sample_async(
             prompt=model_input,
             num_samples=1,
-            sampling_params=tinker.SamplingParams(stop=stop, max_tokens=phase1_max, temperature=self.temperature),
+            sampling_params=SamplingParams(stop=stop, max_tokens=phase1_max, temperature=self.temperature),
         )
         phase1_tokens = phase1_result.sequences[0].tokens
         phase1_logprobs = phase1_result.sequences[0].logprobs
@@ -115,16 +112,16 @@ class TwoPhaseTokenCompleter(TokenCompleter):
 
         # Phase 2: Didn't hit stop, force completion
         # Phase 2 budget = context_window - prompt - phase1 - buffer
-        
+
         # Already in final channel? Just continue without prefill
         if self._contains_subsequence(phase1_tokens, self.GPTOSS_FINAL_CHANNEL_INDICATOR):
-            new_chunks = list(model_input.chunks) + [tinker.types.EncodedTextChunk(tokens=phase1_tokens)]
+            phase2_prompt = TokenSequence(tokens=model_input.tokens + phase1_tokens)
             phase2_max = self.context_window - prompt_length - len(phase1_tokens) - self.context_buffer
             if phase2_max <= 0:
                 return TokensWithLogprobs(tokens=phase1_tokens, maybe_logprobs=phase1_logprobs)
             phase2_result = await self.sampling_client.sample_async(
-                prompt=tinker.ModelInput(chunks=new_chunks), num_samples=1,
-                sampling_params=tinker.SamplingParams(stop=stop, max_tokens=phase2_max, temperature=self.temperature),
+                prompt=phase2_prompt, num_samples=1,
+                sampling_params=SamplingParams(stop=stop, max_tokens=phase2_max, temperature=self.temperature),
             )
             phase2_tokens = phase2_result.sequences[0].tokens
             phase2_logprobs = phase2_result.sequences[0].logprobs
@@ -140,10 +137,7 @@ class TwoPhaseTokenCompleter(TokenCompleter):
             prefill_text = self.PHASE2_PREFILL + self.GPTOSS_FINAL_MARKER
         prefill_tokens = self.tokenizer.encode(prefill_text, add_special_tokens=False)
 
-        new_chunks = list(model_input.chunks) + [
-            tinker.types.EncodedTextChunk(tokens=phase1_tokens),
-            tinker.types.EncodedTextChunk(tokens=prefill_tokens),
-        ]
+        phase2_prompt = TokenSequence(tokens=model_input.tokens + phase1_tokens + prefill_tokens)
         phase2_max = self.context_window - prompt_length - len(phase1_tokens) - len(prefill_tokens) - self.context_buffer
         if phase2_max <= 0:
             return TokensWithLogprobs(
@@ -153,8 +147,8 @@ class TwoPhaseTokenCompleter(TokenCompleter):
             )
 
         phase2_result = await self.sampling_client.sample_async(
-            prompt=tinker.ModelInput(chunks=new_chunks), num_samples=1,
-            sampling_params=tinker.SamplingParams(stop=stop, max_tokens=phase2_max, temperature=self.temperature),
+            prompt=phase2_prompt, num_samples=1,
+            sampling_params=SamplingParams(stop=stop, max_tokens=phase2_max, temperature=self.temperature),
         )
         phase2_tokens = phase2_result.sequences[0].tokens
         phase2_logprobs = phase2_result.sequences[0].logprobs
@@ -165,4 +159,3 @@ class TwoPhaseTokenCompleter(TokenCompleter):
             maybe_logprobs=phase1_logprobs + [0.0] * len(prefill_tokens) + phase2_logprobs,
             maybe_mask=[1.0] * len(phase1_tokens) + [0.0] * len(prefill_tokens) + [1.0] * len(phase2_tokens),
         )
-

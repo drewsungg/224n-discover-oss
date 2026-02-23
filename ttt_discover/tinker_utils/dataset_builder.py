@@ -9,7 +9,7 @@ import logging
 import re
 
 import chz
-import tinker
+from ttt_discover.opentinker_backend.data_types import TokenSequence
 from ttt_discover.tinker_utils import renderers, logtree
 from ttt_discover.rl.types import (
     ProblemEnv, ProblemGroupBuilder, EnvGroupBuilder, RLDataset, RLDatasetBuilder,
@@ -420,7 +420,7 @@ class Environment(ProblemEnv):
         step_result = StepResult(
             reward=reward,
             episode_done=True,
-            next_observation=tinker.ModelInput.empty(),
+            next_observation=TokenSequence.empty(),
             next_stop_condition=self.stop_condition,
             metrics=metrics,
         )

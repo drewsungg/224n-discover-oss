@@ -183,8 +183,7 @@ import logging
 import os
 from typing import Any, Literal
 
-import tinker
-
+from ttt_discover.opentinker_backend.clients import OpenTinkerTrainingSession
 from ttt_discover.tinker_utils.trace import scope, update_scope_context
 
 CHECKPOINTS_BASE_NAME = "checkpoints.jsonl"
@@ -238,28 +237,23 @@ def get_last_checkpoint(log_dir: str, required_key: str = "state_path") -> dict[
 
 @scope
 async def save_checkpoint_async(
-    training_client: tinker.TrainingClient,
+    training_session: OpenTinkerTrainingSession,
     name: str,
     log_path: str,
     loop_state: dict[str, Any],
     kind: Literal["state", "sampler", "both"] = "state",
 ) -> dict[str, str]:
-    """Save model checkpoint.
+    """Save model checkpoint via OpenTinker.
     Args:
-        training_client: Training client to save from
+        training_session: OpenTinker training session
         name: Name for the checkpoint
         log_path: Path to the log directory, where we can find checkpoints.jsonl file
     Returns:
         Path to the saved checkpoint
     """
-    futures = {}
-    if kind in ["state", "both"]:
-        futures["state"] = await training_client.save_state_async(name)
-    if kind in ["sampler", "both"]:
-        futures["sampler"] = await training_client.save_weights_for_sampler_async(name)
-
-    results = {k: await v.result_async() for k, v in futures.items()}
-    paths = {k + "_path": v.path for k, v in results.items()}
+    result = training_session.save_checkpoint()
+    checkpoint_dir = result.get("result", {}).get("checkpoint_dir", "")
+    paths = {"state_path": checkpoint_dir}
     update_scope_context(paths)
     logger.info(f"Saved checkpoints: {paths}")
     full_dict = {"name": name, **loop_state, **paths}

@@ -11,8 +11,8 @@ from enum import StrEnum
 from typing import NotRequired, TypedDict, Literal, Protocol, TYPE_CHECKING, Any, TypeAlias
 from functools import cache
 
-import tinker
 import torch
+from ttt_discover.opentinker_backend.data_types import EncodedTextChunk, ModelInputChunk, TokenSequence
 import pydantic
 
 from functools import cache
@@ -140,18 +140,18 @@ class RenderedMessage(TypedDict):
 
     Args:
 
-    prefix: NotRequired[tinker.EncodedTextChunk]
+    prefix: NotRequired[EncodedTextChunk]
         Message header that typically includes the speaker's role in the conversation.
-    content: list[tinker.ModelInputChunk]
+    content: list[ModelInputChunk]
         Inner parts of the message that may include spans of image and text.
-    suffix: NotRequired[tinker.EncodedTextChunk]
+    suffix: NotRequired[EncodedTextChunk]
         Message header that typically includes the turn stop token.
 
     """
 
-    prefix: NotRequired[tinker.EncodedTextChunk]
-    content: list[tinker.ModelInputChunk]
-    suffix: NotRequired[tinker.EncodedTextChunk]
+    prefix: NotRequired[EncodedTextChunk]
+    content: list[ModelInputChunk]
+    suffix: NotRequired[EncodedTextChunk]
 
 
 class TrainOnWhat(StrEnum):
@@ -195,7 +195,7 @@ class Renderer(Protocol):
 
     def build_generation_prompt(
         self, messages: list[Message], role: Role = "assistant", prefill: str | None = None
-    ) -> tinker.ModelInput:
+    ) -> TokenSequence:
         """
         Generates tokens for sampling from the model.
 
@@ -205,9 +205,9 @@ class Renderer(Protocol):
             prefill: an optional string to prefill in the model's generation.
         """
 
-        chunks: list[tinker.types.ModelInputChunk] = []
+        chunks: list[EncodedTextChunk] = []
         if self._bos_tokens:
-            chunks.append(tinker.types.EncodedTextChunk(tokens=self._bos_tokens))
+            chunks.append(EncodedTextChunk(tokens=self._bos_tokens))
         for idx, message in enumerate(messages):
             rendered_message = self.render_message(idx, message)
             ob_chunk = rendered_message.get("prefix")
@@ -222,17 +222,17 @@ class Renderer(Protocol):
             chunks.append(ob_chunk)
         if prefill:
             chunks.append(
-                tinker.types.EncodedTextChunk(
+                EncodedTextChunk(
                     tokens=self.tokenizer.encode(prefill, add_special_tokens=False)
                 )
             )
-        return tinker.ModelInput(chunks=chunks)
+        return TokenSequence.from_chunks(chunks)
 
     def build_supervised_example(
         self,
         messages: list[Message],
         train_on_what: TrainOnWhat = TrainOnWhat.LAST_ASSISTANT_MESSAGE,
-    ) -> tuple[tinker.ModelInput, torch.Tensor]:
+    ) -> tuple[TokenSequence, torch.Tensor]:
         """
         Generates tokens and weights (for SFT) in the most standard way; by concatenating
         together tokens and weights for each message.
@@ -249,14 +249,14 @@ class Renderer(Protocol):
 
         Returns:
             A tuple of two tensors:
-                - model_input: the tinker ModelInput for your model
+                - model_input: the TokenSequence for your model
                 - weights: a tensor of weights
         """
 
-        model_input_chunks_weights: list[tuple[tinker.types.ModelInputChunk, float]] = []
+        model_input_chunks_weights: list[tuple[EncodedTextChunk, float]] = []
         if self._bos_tokens:
             model_input_chunks_weights.append(
-                (tinker.types.EncodedTextChunk(tokens=self._bos_tokens), 0.0)
+                (EncodedTextChunk(tokens=self._bos_tokens), 0.0)
             )
 
         for idx, message in enumerate(messages):
@@ -312,7 +312,7 @@ class Renderer(Protocol):
         weights_tensor = torch.tensor(weights_data)
 
         model_input_chunks = [chunk for chunk, _ in model_input_chunks_weights]
-        return tinker.ModelInput(chunks=model_input_chunks), weights_tensor
+        return TokenSequence.from_chunks(model_input_chunks), weights_tensor
 
 
 def parse_response_for_stop_token(
@@ -393,11 +393,11 @@ class Qwen3Renderer(Renderer):
         
         ac_content += "<|im_end|>"
         # Action part
-        prefix = tinker.types.EncodedTextChunk(
+        prefix = EncodedTextChunk(
             tokens=self.tokenizer.encode(ob_str, add_special_tokens=False)
         )
-        content: list[tinker.ModelInputChunk] = [
-            tinker.types.EncodedTextChunk(
+        content: list[EncodedTextChunk] = [
+            EncodedTextChunk(
                 tokens=self.tokenizer.encode(ac_content, add_special_tokens=False)
             )
         ]
@@ -443,11 +443,11 @@ class Qwen3InstructRenderer(Qwen3Renderer):
         ac_content = message["content"]
         ac_content += "<|im_end|>"
         # Action part
-        prefix = tinker.types.EncodedTextChunk(
+        prefix = EncodedTextChunk(
             tokens=self.tokenizer.encode(ob_str, add_special_tokens=False)
         )
-        content: list[tinker.ModelInputChunk] = [
-            tinker.types.EncodedTextChunk(
+        content: list[EncodedTextChunk] = [
+            EncodedTextChunk(
                 tokens=self.tokenizer.encode(ac_content, add_special_tokens=False)
             )
         ]
@@ -520,11 +520,11 @@ class GptOssRenderer(Renderer):
             # <|return|> ends the last-message in harmony (but should be replaced by <|end|> when continuing the convo)
             ac_str += "<|return|>"
 
-        prefix = tinker.types.EncodedTextChunk(
+        prefix = EncodedTextChunk(
             tokens=self.tokenizer.encode(ob_str, add_special_tokens=False)
         )
-        content: list[tinker.ModelInputChunk] = [
-            tinker.types.EncodedTextChunk(
+        content: list[EncodedTextChunk] = [
+            EncodedTextChunk(
                 tokens=self.tokenizer.encode(ac_str, add_special_tokens=False)
             )
         ]
