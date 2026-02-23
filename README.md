@@ -41,7 +41,7 @@ Set environment variables:
 
 ```bash
 export HF_TOKEN="..."
-export TINKER_API_KEY="..."      
+export VLLM_SERVER_URL="..."     # URL of vLLM server for inference
 export WANDB_API_KEY="..."       
 export WANDB_ENTITY="..."        
 ```
