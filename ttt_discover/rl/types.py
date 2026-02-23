@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Sequence, TypeAlias, Any
 
 import chz
-import tinker
+from ttt_discover.opentinker_backend.data_types import TokenSequence
 from ttt_discover.tinker_utils import logtree, renderers
 from ttt_discover.tinker_utils.completers import StopCondition, TokensWithLogprobs
 from ttt_discover.tinker_utils.misc_utils import safezip
@@ -17,7 +17,7 @@ from ttt_discover.tinker_utils.misc_utils import safezip
 logger = logging.getLogger(__name__)
 
 Action: TypeAlias = list[int]
-Observation: TypeAlias = tinker.ModelInput
+Observation: TypeAlias = TokenSequence
 Logprobs: TypeAlias = list[float]
 Metrics: TypeAlias = dict[str, float | int]
 
@@ -220,7 +220,7 @@ class ProblemEnv(Env):
         return StepResult(
             reward=total_reward,
             episode_done=True,
-            next_observation=tinker.ModelInput.empty(),
+            next_observation=TokenSequence.empty(),
             next_stop_condition=self.stop_condition,
             metrics={
                 "format": correct_format,
