@@ -6,15 +6,19 @@ import asyncio
 import logging
 import os
 import time
-from typing import Any, Dict, List, Sequence, cast
+from typing import Any, Dict, List, Literal, Sequence, cast
 
 import chz
 import numpy as np
 import wandb
 import math
-import tinker
 import torch
-from tinker.types import LossFnType
+from ttt_discover.opentinker_backend.data_types import TrainingDatum, TokenSequence
+from ttt_discover.opentinker_backend.clients import (
+    VLLMSamplingClient,
+    OpenTinkerTrainingSession,
+    datums_to_dataproto,
+)
 from ttt_discover.tinker_utils.misc_utils import get_last_checkpoint, save_checkpoint_async
 from ttt_discover.tinker_utils.completers import TwoPhaseTokenCompleter
 from ttt_discover.rl.data_processing import (
@@ -38,11 +42,14 @@ from ttt_discover.tinker_utils.ml_log import WandbLogger
 
 logger = logging.getLogger(__name__)
 
+# Loss function type (was tinker.types.LossFnType)
+LossFnType = Literal["importance_sampling", "ppo"]
+
 
 @scope
 async def incorporate_kl_penalty(
-    data_D: List[tinker.Datum],
-    base_sampling_client: tinker.SamplingClient,
+    data_D: List[TrainingDatum],
+    base_vllm_client: VLLMSamplingClient,
     kl_penalty_coef: float,
 ) -> Dict[str, float]:
     """
@@ -51,18 +58,18 @@ async def incorporate_kl_penalty(
     """
     # Compute logprobs at all data items
     full_sequence_inputs_D = [
-        datum.model_input.append_int(cast(int, datum.loss_fn_inputs["target_tokens"].data[-1]))
+        datum.model_input.append_int(cast(int, datum.loss_fn_inputs["target_tokens"][-1].item()))
         for datum in data_D
     ]
     base_logprobs_D = await asyncio.gather(
         *[
-            base_sampling_client.compute_logprobs_async(sequence_input)
+            base_vllm_client.compute_logprobs_async(sequence_input)
             for sequence_input in full_sequence_inputs_D
         ]
     )
     # compute the logprob differences, zeroed out when the mask == 0
-    sampled_logprobs_D = [datum.loss_fn_inputs["logprobs"].to_torch() for datum in data_D]
-    float_masks = [datum.loss_fn_inputs["mask"].to_torch().float() for datum in data_D]
+    sampled_logprobs_D = [datum.loss_fn_inputs["logprobs"] for datum in data_D]
+    float_masks = [datum.loss_fn_inputs["mask"].float() for datum in data_D]
     logprob_diffs = [
         (sampled_logprobs - torch.tensor(base_logprobs[1:])) * mask
         for base_logprobs, sampled_logprobs, mask in safezip(
@@ -74,8 +81,8 @@ async def incorporate_kl_penalty(
     )
     for i, datum in enumerate(data_D):
         kl_advantages = kl_penalty_coef * float_masks[i] * (avg_logp_diff - logprob_diffs[i])
-        datum.loss_fn_inputs["advantages"] = tinker.TensorData.from_torch(
-            datum.loss_fn_inputs["advantages"].to_torch() + kl_advantages
+        datum.loss_fn_inputs["advantages"] = (
+            datum.loss_fn_inputs["advantages"] + kl_advantages
         )
     return {"kl_policy_base": float(avg_logp_diff)}
 
@@ -95,7 +102,7 @@ def compute_advantages(trajectory_groups_P: List[TrajectoryGroup], adv_estimator
             e = torch.exp(beta * s_safe)
             k = e.shape[0]
             if k == 1:
-                Z = e 
+                Z = e
             else:
                 Z = (e.sum() - e) / (k - 1)
             w = e / (Z + 1e-12)
@@ -120,8 +127,8 @@ def compute_advantages(trajectory_groups_P: List[TrajectoryGroup], adv_estimator
                     logits = b * (r - r.max(dim=0, keepdim=True).values)      # stable
                     logq = logits - torch.logsumexp(logits, dim=0, keepdim=True)
                     q = torch.exp(logq)
-                    kl = (q * (logq + logK)).sum(dim=0)   
-                    return float(kl.mean().item())    
+                    kl = (q * (logq + logK)).sum(dim=0)
+                    return float(kl.mean().item())
 
                 lo, hi = 0.0, 1.0
                 if kl_hat(hi) < delta:
@@ -161,108 +168,29 @@ def compute_advantages(trajectory_groups_P: List[TrajectoryGroup], adv_estimator
 
 
 @scope
-async def enqueue_optim_step(
-    training_client: tinker.TrainingClient,
-    learning_rate: float,
-) -> tinker.APIFuture[tinker.OptimStepResponse]:
-    """Enqueue an optimizer step and return the future"""
-    adam_params = tinker.AdamParams(learning_rate=learning_rate, beta1=0.9, beta2=0.95, eps=1e-8)
-    optim_step_future = await training_client.optim_step_async(adam_params)
-    return optim_step_future
-
-
-@scope
-async def consume_optim_step(
-    optim_step_future: tinker.APIFuture[tinker.OptimStepResponse],
-) -> tinker.OptimStepResponse:
-    """Apply the accumulated gradients to update the model weights and return the result"""
-    return await optim_step_future.result_async()
-
-
-@scope
-def remove_mask(datum: tinker.Datum) -> tinker.Datum:
-    return tinker.Datum(
-        model_input=datum.model_input,
-        loss_fn_inputs={k: v for k, v in datum.loss_fn_inputs.items() if k != "mask"},
-    )
-
-
-@scope
-async def enqueue_forward_backward(
-    training_client: tinker.TrainingClient,
-    batch_d: List[tinker.Datum],
-    loss_fn: LossFnType,
-) -> tinker.APIFuture[tinker.ForwardBackwardOutput]:
-    """Enqueue a forward-backward pass for a minibatch of data and return the future"""
-    fwd_bwd_future = await training_client.forward_backward_async(
-        list(map(remove_mask, batch_d)), loss_fn=loss_fn
-    )
-    return fwd_bwd_future
-
-
-@scope
-async def consume_forward_backward(
-    fwd_bwd_future: tinker.APIFuture[tinker.ForwardBackwardOutput],
-) -> List[torch.Tensor]:
-    """Consume the result of a forward-backward pass and return the training logprobs"""
-    fwd_bwd_result = await fwd_bwd_future.result_async()
-
-    # Extract training logprobs from loss_fn_outputs
-    training_logprobs_D: list[torch.Tensor] = []
-    for output in fwd_bwd_result.loss_fn_outputs:
-        training_logprobs = output["logprobs"].to_torch()
-        training_logprobs_D.append(training_logprobs)
-
-    # We dont display fwd_bwd_result.metrics to avoid spam
-    return training_logprobs_D
-
-
-@scope
 async def train_step(
-    data_D: List[tinker.Datum],
-    training_client: tinker.TrainingClient,
+    data_D: List[TrainingDatum],
+    training_session: OpenTinkerTrainingSession,
     learning_rate: float,
     num_substeps: int,
     loss_fn: LossFnType,
+    tokenizer: Tokenizer,
 ) -> List[torch.Tensor]:
-    """Train the model on collected trajectories."""
-    batches_md = split_list(data_D, min(num_substeps, len(data_D)))
+    """Train the model on collected trajectories using OpenTinker's train_step API."""
+    if len(data_D) == 0:
+        return []
+
+    # Convert TrainingDatums to DataProto for OpenTinker
+    batch = datums_to_dataproto(data_D, tokenizer)
+
+    # Execute training step via OpenTinker server
+    result = await asyncio.to_thread(training_session.train_step, batch)
+
+    # Extract training logprobs from result if available
     training_logprobs_D: list[torch.Tensor] = []
-
-    if len(batches_md) == 0:
-        return training_logprobs_D
-
-    enqueued_futures: (
-        tuple[
-            tinker.APIFuture[tinker.ForwardBackwardOutput],
-            tinker.APIFuture[tinker.OptimStepResponse],
-        ]
-        | None
-    ) = (
-        await enqueue_forward_backward(training_client, batches_md[0], loss_fn),
-        await enqueue_optim_step(training_client, learning_rate),
-    )
-
-    for i in range(len(batches_md)):
-        assert enqueued_futures is not None
-
-        fwd_bwd_future, optim_step_future = enqueued_futures
-        enqueued_futures = None
-
-        # Enqueue the next forward-backward pass and optimizer step before consuming the current result
-        if i != len(batches_md) - 1:
-            assert enqueued_futures is None
-            enqueued_futures = (
-                await enqueue_forward_backward(training_client, batches_md[i + 1], loss_fn),
-                await enqueue_optim_step(training_client, learning_rate),
-            )
-
-        training_logprobs = await consume_forward_backward(fwd_bwd_future)
-        training_logprobs_D.extend(training_logprobs)
-
-        await consume_optim_step(optim_step_future)
-
-    assert enqueued_futures is None
+    metrics = result.get("metrics", {})
+    if metrics:
+        logger.info(f"Train step metrics: {metrics}")
 
     return training_logprobs_D
 
@@ -301,9 +229,15 @@ class Config:
 
     # Two-phase sampling: phase1_max_tokens for token completion
     phase1_max_tokens: int = 26000
-    
+
     # Local model path (avoids HuggingFace API rate limits)
     local_model_path: str | None = None
+
+    # OpenTinker server configuration
+    server_url: str | None = None
+    scheduler_url: str | None = None
+    vllm_server_url: str | None = None
+    num_gpus: int | None = None
 
 
 @chz.chz
@@ -325,7 +259,7 @@ class WrappedTrajectoryGroup:
 
 @scope
 async def do_group_rollout_and_filter_constant_reward(
-    sampling_client: tinker.SamplingClient,
+    vllm_client: VLLMSamplingClient,
     env_group_builder: EnvGroupBuilder,
     temperature: float,
     do_remove_constant_reward_groups: bool,
@@ -336,9 +270,9 @@ async def do_group_rollout_and_filter_constant_reward(
     from ttt_discover.tinker_utils.misc_utils import get_tokenizer
 
     tokenizer = get_tokenizer(model_name)
-    
+
     policy = TwoPhaseTokenCompleter(
-        sampling_client=sampling_client,
+        sampling_client=vllm_client,
         tokenizer=tokenizer,
         phase1_max_tokens=phase1_max_tokens,
         temperature=temperature,
@@ -354,26 +288,28 @@ async def do_group_rollout_and_filter_constant_reward(
 
 
 @scope
-async def save_checkpoint_and_get_sampling_client(
-    training_client: tinker.TrainingClient,
+async def save_checkpoint_and_get_vllm_client(
+    training_session: OpenTinkerTrainingSession,
+    vllm_client: VLLMSamplingClient,
     i_batch: int,
     log_path: str,
     save_every: int,
     start_batch: int = 0,
-) -> tuple[tinker.SamplingClient, dict[str, Any]]:
+) -> tuple[VLLMSamplingClient, dict[str, Any]]:
     metrics = {}
     with timed("save_checkpoint", metrics):
         if save_every > 0 and i_batch > start_batch and i_batch % save_every == 0:
-            path_dict = await save_checkpoint_async(
-                training_client=training_client,
+            await save_checkpoint_async(
+                training_session=training_session,
                 name=f"{i_batch:06d}",
                 log_path=log_path,
                 loop_state={"batch": i_batch},
                 kind="both",
             )
-            return training_client.create_sampling_client(path_dict["sampler_path"]), metrics
-        else:
-            return await training_client.save_weights_and_get_sampling_client_async(), metrics
+    # Return the same vLLM client — the server's model weights are updated in-place
+    # after each train_step, so the vLLM client will use the latest weights
+    # when it's pointed at the training server's inference endpoint.
+    return vllm_client, metrics
 
 
 @scope
@@ -381,14 +317,14 @@ async def prepare_minibatch(
     env_group_builders_P: Sequence[EnvGroupBuilder],
     trajectory_groups_P: list[TrajectoryGroup],
     tokenizer: Tokenizer,
-    service_client: tinker.ServiceClient,
+    vllm_base_client: VLLMSamplingClient | None,
     model_name: str,
     kl_penalty_coef: float,
     log_path: str | None = None,
     train_step: int | None = None,
     adv_estimator: str="mean_baseline",
     adv_estimator_beta: float = 2.0,
-) -> tuple[list[tinker.Datum], dict[str, Any]]:
+) -> tuple[list[TrainingDatum], dict[str, Any]]:
     """Converts the trajectories into a minibatch, and provides metrics about the minibatch"""
 
     # Compute trajectory metrics
@@ -411,12 +347,11 @@ async def prepare_minibatch(
         data_D, _metadata_D = assemble_training_data(trajectory_groups_P, advantages_P)
 
     # Incorporate KL penalty if configured
-    if kl_penalty_coef > 0:
+    if kl_penalty_coef > 0 and vllm_base_client is not None:
         with timed("kl_vs_base", metrics):
             kl_penalty_metrics = await incorporate_kl_penalty(
                 data_D,
-                service_client.create_sampling_client(base_model=model_name),
-                # ^^^ TODO: replace with the model we load, if relevant
+                vllm_base_client,
                 kl_penalty_coef,
             )
         metrics.update(kl_penalty_metrics)
@@ -425,15 +360,16 @@ async def prepare_minibatch(
 
 
 @scope
-async def do_train_step_and_get_sampling_client(
+async def do_train_step_and_get_vllm_client(
     cfg: Config,
     i_batch: int,
-    training_client: tinker.TrainingClient,
-    service_client: tinker.ServiceClient,
+    training_session: OpenTinkerTrainingSession,
+    vllm_client: VLLMSamplingClient,
+    vllm_base_client: VLLMSamplingClient | None,
     tokenizer: Tokenizer,
     env_group_builders_P: Sequence[EnvGroupBuilder],
     trajectory_groups_P: list[TrajectoryGroup],
-) -> tuple[tinker.SamplingClient, dict[str, Any]]:
+) -> tuple[VLLMSamplingClient, dict[str, Any]]:
     context = get_scope_context()
     context.attributes["step"] = i_batch
 
@@ -442,7 +378,7 @@ async def do_train_step_and_get_sampling_client(
         env_group_builders_P,
         trajectory_groups_P,
         tokenizer,
-        service_client,
+        vllm_base_client,
         model_name=cfg.model_name,
         kl_penalty_coef=cfg.kl_penalty_coef,
         log_path=cfg.log_path,
@@ -455,14 +391,16 @@ async def do_train_step_and_get_sampling_client(
     with timed("train", metrics):
         training_logprobs_D = await train_step(
             data_D,
-            training_client,
+            training_session,
             cfg.learning_rate,
             cfg.num_substeps,
             cfg.loss_fn,
+            tokenizer,
         )
 
-    sampling_client, full_batch_metrics = await save_checkpoint_and_get_sampling_client(
-        training_client,
+    vllm_client, full_batch_metrics = await save_checkpoint_and_get_vllm_client(
+        training_session,
+        vllm_client,
         # NOTE: saving the checkpoint as the i + 1 step
         i_batch + 1,
         cfg.log_path,
@@ -470,7 +408,7 @@ async def do_train_step_and_get_sampling_client(
     )
     metrics.update(full_batch_metrics)
 
-    return sampling_client, metrics
+    return vllm_client, metrics
 
 
 @scope
@@ -479,8 +417,9 @@ async def do_sync_training(
     end_batch: int,
     num_batches: int,
     cfg: Config,
-    training_client: tinker.TrainingClient,
-    service_client: tinker.ServiceClient,
+    training_session: OpenTinkerTrainingSession,
+    vllm_client: VLLMSamplingClient,
+    vllm_base_client: VLLMSamplingClient | None,
     dataset: RLDataset,
     ml_logger: ml_log.Logger,
     tokenizer: Tokenizer,
@@ -489,12 +428,6 @@ async def do_sync_training(
     num_batches_per_epoch = len(dataset)
     if num_batches_per_epoch == 0:
         raise ValueError("RLDataset must contain at least one batch")
-
-    # Initial sampling client
-    print("Get sampling client...")
-    sampling_client, _ = await save_checkpoint_and_get_sampling_client(
-        training_client, start_batch, cfg.log_path, cfg.save_every, start_batch
-    )
 
     for i_batch in range(start_batch, end_batch):
         train_table = None
@@ -535,7 +468,7 @@ async def do_sync_training(
                 *[
                     asyncio.create_task(
                         do_group_rollout_and_filter_constant_reward(
-                            sampling_client,
+                            vllm_client,
                             builder,
                             temperature=cfg.temperature,
                             do_remove_constant_reward_groups=False,
@@ -557,11 +490,12 @@ async def do_sync_training(
 
         # Train step
         print("Training...")
-        sampling_client, train_step_metrics = await do_train_step_and_get_sampling_client(
+        vllm_client, train_step_metrics = await do_train_step_and_get_vllm_client(
             cfg,
             i_batch,
-            training_client,
-            service_client,
+            training_session,
+            vllm_client,
+            vllm_base_client,
             tokenizer,
             env_group_builders_P,
             trajectory_groups_P,
@@ -582,7 +516,7 @@ async def do_sync_training(
                         data=table_data
                     )
             }
-        
+
         if len(ml_logger.loggers) >= 2:
             if train_table is not None and isinstance(ml_logger.loggers[2], WandbLogger):
                 ml_logger.loggers[2].log_metrics(train_table, step=i_batch)
@@ -623,45 +557,64 @@ async def main(
     else:
         start_batch = 0
 
-    print("Create training client...")
-    service_client = tinker.ServiceClient(base_url=None)
-    print("Training client created!")
+    # Create OpenTinker training session
+    print("Creating OpenTinker training session...")
+    training_config = {
+        "model_name": cfg.model_name,
+        "learning_rate": cfg.learning_rate,
+        "lora_rank": cfg.lora_rank,
+        "loss_fn": cfg.loss_fn,
+    }
+    if cfg.load_checkpoint_path:
+        training_config["checkpoint_path"] = cfg.load_checkpoint_path
     if resume_info:
-        # Resuming interrupted training - load optimizer state for proper continuation
-        training_client = (
-            await service_client.create_training_client_from_state_with_optimizer_async(
-                resume_info["state_path"]
-            )
-        )
-        logger.info(f"Resumed training from {resume_info['state_path']}")
-    elif cfg.load_checkpoint_path:
-        # Starting fresh from a checkpoint - load weights only (fresh optimizer)
-        training_client = await service_client.create_training_client_from_state_async(
-            cfg.load_checkpoint_path
-        )
-        logger.info(f"Loaded weights from {cfg.load_checkpoint_path}")
-    else:
-        training_client = await service_client.create_lora_training_client_async(
-            cfg.model_name, rank=cfg.lora_rank
+        training_config["resume_path"] = resume_info.get("state_path")
+
+    training_session = OpenTinkerTrainingSession(
+        server_url=cfg.server_url,
+        scheduler_url=cfg.scheduler_url,
+        config=training_config,
+        num_gpus=cfg.num_gpus,
+    )
+    print("Training session created!")
+
+    # Create vLLM sampling client for inference
+    vllm_url = cfg.vllm_server_url
+    if not vllm_url:
+        raise ValueError("vllm_server_url must be provided for sampling")
+    vllm_client = VLLMSamplingClient(
+        vllm_server_url=vllm_url,
+        model_name=cfg.model_name,
+    )
+
+    # Create base model vLLM client for KL penalty (if needed)
+    vllm_base_client: VLLMSamplingClient | None = None
+    if cfg.kl_penalty_coef > 0:
+        # Use a separate vLLM server for the base model
+        # TODO: make base_vllm_server_url configurable
+        vllm_base_client = VLLMSamplingClient(
+            vllm_server_url=vllm_url,
+            model_name=cfg.model_name,
         )
 
-    # Get tokenizer (use local path if provided, otherwise from training client)
+    # Get tokenizer
     if cfg.local_model_path:
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(cfg.local_model_path, use_fast=True)
     else:
-        tokenizer = training_client.get_tokenizer()
+        from ttt_discover.tinker_utils.misc_utils import get_tokenizer
+        tokenizer = get_tokenizer(cfg.model_name)
 
     # Create dataset from thunk
     print("Create dataset...")
     dataset = await cfg.dataset_builder()
     print("Dataset created!")
-    
+
     # If resuming from step > 0, reload sampler from the correct checkpoint step
     if resume_info and start_batch > 0 and hasattr(dataset, 'sampler') and hasattr(dataset.sampler, 'reload_from_step'):
         logger.info(f"Reloading sampler state from step {start_batch}")
         dataset.sampler.reload_from_step(start_batch)
-    
+
     num_batches_per_epoch = len(dataset)
     if num_batches_per_epoch == 0:
         raise ValueError("RLDataset must contain at least one batch")
@@ -677,8 +630,9 @@ async def main(
         end_batch=num_batches_total,
         num_batches=num_batches_total,
         cfg=cfg,
-        training_client=training_client,
-        service_client=service_client,
+        training_session=training_session,
+        vllm_client=vllm_client,
+        vllm_base_client=vllm_base_client,
         dataset=dataset,
         ml_logger=ml_logger,
         tokenizer=tokenizer,
@@ -686,8 +640,8 @@ async def main(
 
     # Save final checkpoint
     if start_batch < num_batches_total:
-        _ = await save_checkpoint_async(
-            training_client=training_client,
+        await save_checkpoint_async(
+            training_session=training_session,
             name="final",
             log_path=cfg.log_path,
             kind="both",
@@ -697,5 +651,8 @@ async def main(
         logger.info("Training was already complete; nothing to do")
 
     # Cleanup
+    await vllm_client.close()
+    if vllm_base_client:
+        await vllm_base_client.close()
     ml_logger.close()
     logger.info("Training completed successfully")
